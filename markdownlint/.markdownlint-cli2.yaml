@@ -1,0 +1,4 @@
+# Global markdownlint settings, passed to the linter by nvim/lua/plugins/lint.lua.
+# A project's own .markdownlint* file still takes precedence for that project.
+config:
+  MD013: false # line length: prose and tables are fine long
