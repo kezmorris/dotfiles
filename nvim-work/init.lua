@@ -42,6 +42,50 @@ o.wildmode = { "longest:full", "full" }
 o.list = true
 o.listchars = { tab = "  ", trail = "·", nbsp = "␣" }
 o.sessionoptions = { "buffers", "curdir", "folds", "help", "tabpages", "winsize" }
+-- Clipboard. With no clipboard tool (a container or SSH), copies go out to the
+-- terminal as an OSC 52 escape, which tmux (set-clipboard on) and most
+-- terminals put on the machine's clipboard. Pasting can't read that clipboard
+-- back, so "+p pastes the last copy; use the terminal's paste (Cmd-V) for
+-- text copied elsewhere.
+if vim.env.DISPLAY == nil and vim.env.WAYLAND_DISPLAY == nil and fn.executable("pbcopy") == 0 then
+  -- base64 (vim.base64 arrived in 0.10), two output characters per 12 bits.
+  local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local pairs12 = {}
+  for i = 0, 4095 do
+    local hi, lo = math.floor(i / 64) + 1, i % 64 + 1
+    pairs12[i] = chars:sub(hi, hi) .. chars:sub(lo, lo)
+  end
+  local function base64(s)
+    local out, k, len = {}, 0, #s
+    for i = 1, len - 2, 3 do
+      local a, b, c = s:byte(i, i + 2)
+      local n = a * 65536 + b * 256 + c
+      out[k + 1], out[k + 2], k = pairs12[math.floor(n / 4096)], pairs12[n % 4096], k + 2
+    end
+    local rest = len % 3
+    if rest > 0 then
+      local a, b = s:byte(len - rest + 1, len)
+      local n = a * 65536 + (b or 0) * 256
+      local quad = pairs12[math.floor(n / 4096)] .. pairs12[n % 4096]
+      out[k + 1] = rest == 1 and quad:sub(1, 2) .. "==" or quad:sub(1, 3) .. "="
+    end
+    return table.concat(out)
+  end
+  local last = { {}, "v" }
+  local function copy(lines, regtype)
+    last = { lines, regtype }
+    local text = table.concat(lines, "\n")
+    -- tmux drops escapes over 1 MiB, so don't encode what can't arrive.
+    if #text > 786000 then return vim.notify("Too big for the system clipboard; \"+p still pastes it here") end
+    fn.chansend(vim.v.stderr, "\027]52;c;" .. base64(text) .. "\007")
+  end
+  local function paste() return last end
+  vim.g.clipboard = {
+    name = "osc52",
+    copy = { ["+"] = copy, ["*"] = copy },
+    paste = { ["+"] = paste, ["*"] = paste },
+  }
+end
 if fn.has("clipboard") == 1 then o.clipboard = "unnamedplus" end
 o.fillchars = { eob = " " } -- no ~ after the end of a file
 -- Colours: see "Theme" near the end.
