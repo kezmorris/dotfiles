@@ -56,6 +56,9 @@ link "$DOTFILES/tmux/tmux.conf" "$HOME/.tmux.conf"
 
 step "Neovim plugins (pinned versions from lazy-lock.json)"
 nvim --headless "+Lazy! restore" +qa
+# That run quits as soon as plugins are in place, possibly mid-way through
+# parser downloads. Clear any half-finished ones so the next step starts clean.
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}"/nvim/tree-sitter-*
 
 step "Language servers, formatters and syntax parsers (this takes a few minutes)"
 nvim --headless -c "luafile $DOTFILES/scripts/nvim-bootstrap.lua" || warn "some tools failed - see above"
