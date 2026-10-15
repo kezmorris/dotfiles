@@ -129,7 +129,7 @@ vim.g.netrw_hide = 1
 local explorer = { selected = {} }
 local ns_sel = api.nvim_create_namespace("explorer_selected")
 local function short(p) return fn.fnamemodify(p, ":~:.") end
-local function abspath(p) return (fn.fnamemodify(p, ":p"):gsub("/$", "")) end
+local function abspath(p) return (fn.simplify(fn.fnamemodify(p, ":p")):gsub("/$", "")) end -- no "..", no trailing /
 
 local function ex_top() return vim.w.netrw_treetop or vim.b.netrw_curdir or fn.getcwd() end
 -- Every line of the tree as { path, depth, dir }. Line 1 is "../", then the
@@ -161,6 +161,7 @@ local function ex_target_dir() -- the folder under the cursor, or the folder of 
   return e.dir and e.path or fn.fnamemodify(e.path, ":h")
 end
 local function netrw_key(keys) vim.cmd('execute "normal ' .. keys .. '"') end -- uses netrw's own maps
+local function netrw_toggle() netrw_key([[\<Plug>NetrwLocalBrowseCheck]]) end -- netrw's Enter: expand / collapse / go up
 
 local function ex_paint()
   api.nvim_buf_clear_namespace(0, ns_sel, 0, -1)
@@ -186,7 +187,7 @@ local function ex_reveal(path, expand)
     if not best then return end
     fn.cursor(best, 1)
     if not expand or ex_expanded(best_path) then return end
-    netrw_key([[\<CR>]])
+    netrw_toggle()
   end
 end
 -- Rebuild the tree from disk. netrw's own refresh is buggy in tree mode (folders
@@ -202,7 +203,7 @@ local function ex_refresh(focus)
     if dir ~= top and fn.isdirectory(dir) == 1 then
       ex_reveal(dir, true)
       local e = ex_cur()
-      if e and e.path == dir and not ex_expanded(dir) then netrw_key([[\<CR>]]) end
+      if e and e.path == dir and not ex_expanded(dir) then netrw_toggle() end
     end
   end
   if focus then ex_reveal(focus, true) else fn.cursor(math.min(line, fn.line("$")), 1) end
@@ -217,9 +218,33 @@ local function ex_ask(question, paths, on_yes)
     if a and a:lower():sub(1, 1) == "y" then on_yes() end
   end)
 end
-local function ex_wipe(path) -- drop the buffer for a file that's gone
-  local b = fn.bufnr(path)
-  if b ~= -1 and not vim.bo[b].modified then pcall(vim.cmd, "bwipeout " .. b) end
+local function ex_buffers_under(path) -- buffers for path, or for files inside it if it's a folder
+  return vim.tbl_filter(function(b)
+    local name = api.nvim_buf_get_name(b)
+    return name == path or name:sub(1, #path + 1) == path .. "/"
+  end, api.nvim_list_bufs())
+end
+local function ex_wipe(path) -- drop the buffers for files that are gone, keeping their windows
+  for _, b in ipairs(ex_buffers_under(path)) do
+    if not vim.bo[b].modified then
+      for _, w in ipairs(fn.win_findbuf(b)) do
+        api.nvim_win_call(w, function()
+          local alt = fn.bufnr("#")
+          vim.cmd((alt > 0 and alt ~= b and fn.buflisted(alt) == 1) and ("buffer " .. alt) or "enew")
+        end)
+      end
+      pcall(vim.cmd, "bwipeout " .. b)
+    end
+  end
+end
+local function ex_moved(old, new) -- point open buffers at a renamed or moved file / folder
+  for _, b in ipairs(ex_buffers_under(old)) do
+    if not vim.bo[b].modified then
+      if pcall(api.nvim_buf_set_name, b, new .. api.nvim_buf_get_name(b):sub(#old + 1)) then
+        api.nvim_buf_call(b, function() vim.cmd("silent! edit!") end)
+      end
+    end
+  end
 end
 local function ex_selection_or_cursor()
   local paths = vim.tbl_keys(explorer.selected)
@@ -265,11 +290,8 @@ local explorer_actions = {
       fn.mkdir(fn.fnamemodify(dst, ":h"), "p")
       local ok, err = vim.loop.fs_rename(e.path, dst)
       if not ok then return vim.notify(err, vim.log.levels.ERROR) end
-      local b = fn.bufnr(e.path)
-      if b ~= -1 and not vim.bo[b].modified then
-        api.nvim_buf_set_name(b, dst)
-        api.nvim_buf_call(b, function() vim.cmd("silent! edit!") end)
-      end
+      dst = abspath(dst)
+      ex_moved(e.path, dst)
       ex_refresh(dst)
     end)
   end,
@@ -309,8 +331,9 @@ local explorer_actions = {
     local dst = ex_target_dir()
     ex_ask("Move %s into " .. fn.fnamemodify(dst, ":t") .. "/?", paths, function()
       for _, p in ipairs(paths) do
-        local ok, err = vim.loop.fs_rename(p, dst .. "/" .. fn.fnamemodify(p, ":t"))
-        if ok then ex_wipe(p) else vim.notify(("Move %s: %s"):format(short(p), err), vim.log.levels.ERROR) end
+        local to = dst .. "/" .. fn.fnamemodify(p, ":t")
+        local ok, err = vim.loop.fs_rename(p, to)
+        if ok then ex_moved(p, to) else vim.notify(("Move %s: %s"):format(short(p), err), vim.log.levels.ERROR) end
       end
       explorer.selected = {}
       ex_refresh(dst)
@@ -324,10 +347,10 @@ local explorer_actions = {
     end
     vim.cmd("normal! j")
   end,
-  open = function() -- l: open a file, expand a folder (or step into it if it's open)
+  open = function() -- folders and ../: expand (or step into it if it's open), go up
     local e = ex_cur()
     if ex_editable(e) and e.dir and ex_expanded(e.path) then return vim.cmd("normal! j") end
-    netrw_key([[\<CR>]])
+    netrw_toggle()
   end,
   close = function() -- h: collapse this folder, or the folder this file is in
     local e = ex_cur()
@@ -336,7 +359,7 @@ local explorer_actions = {
       if e.depth == 1 then return end -- its folder is the top of the tree
       ex_reveal(fn.fnamemodify(e.path, ":h"))
     end
-    netrw_key([[\<CR>]])
+    netrw_toggle()
   end,
 }
 
@@ -346,21 +369,39 @@ local function explorer_win()
     if vim.w[w].explorer then return w end
   end
 end
-local function main_win() -- the first normal window: not the explorer, not a float
+-- The window files go to: the last one used if it shows a file, else the
+-- first that does (so never the explorer, quickfix, help or a float).
+local function main_win()
+  local function shows_file(w)
+    return w ~= 0 and not vim.w[w].explorer and api.nvim_win_get_config(w).relative == ""
+      and vim.bo[api.nvim_win_get_buf(w)].buftype == ""
+  end
+  local prev = fn.win_getid(fn.winnr("#"))
+  if shows_file(prev) then return prev end
   for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
-    if not vim.w[w].explorer and api.nvim_win_get_config(w).relative == "" then return w end
+    if shows_file(w) then return w end
   end
 end
-local function unstyle(w) -- drop the sidebar's fixed width and darker colours
+local function unstyle(w) -- make a window split off the sidebar (or the sidebar itself) a normal one
+  vim.w[w].explorer = nil
   vim.wo[w].winfixwidth = false
   vim.wo[w].winhighlight = ""
+end
+local function main_win_or_split() -- makes a main window if the explorer is the only one
+  local w = main_win()
+  if w then return w end
+  local from = api.nvim_get_current_win()
+  vim.cmd("botright vsplit")
+  w = api.nvim_get_current_win()
+  unstyle(w)
+  api.nvim_set_current_win(from)
+  return w
 end
 local function explorer_close()
   local w = explorer_win()
   if not w then return end
   if #api.nvim_tabpage_list_wins(0) > 1 then return api.nvim_win_close(w, false) end
   -- It's the only window: turn it back into a normal one.
-  vim.w[w].explorer = nil
   unstyle(w)
   vim.cmd.enew()
 end
@@ -380,6 +421,37 @@ local function explorer_open(dir)
   if file ~= "" and file:sub(1, #dir + 1) == dir .. "/" then ex_reveal(file, true) else fn.cursor(2, 1) end
   ex_paint()
 end
+-- :q in the last file window quits, instead of leaving just the explorer.
+api.nvim_create_autocmd("QuitPre", {
+  callback = function()
+    local cur = api.nvim_get_current_win()
+    if vim.w[cur].explorer then return end
+    local others = vim.tbl_filter(function(w)
+      return w ~= cur and api.nvim_win_get_config(w).relative == ""
+    end, api.nvim_tabpage_list_wins(0))
+    if #others == 1 and vim.w[others[1]].explorer then api.nvim_win_close(others[1], true) end
+  end,
+})
+-- Saving a brand-new file adds it to the tree.
+api.nvim_create_autocmd("BufWritePre", {
+  callback = function(ev) -- only check the disk when there's a tree to update
+    vim.b[ev.buf].ex_new = explorer_win() ~= nil and fn.filereadable(fn.fnamemodify(ev.match, ":p")) == 0
+  end,
+})
+api.nvim_create_autocmd("BufWritePost", {
+  callback = function(ev)
+    local w = explorer_win()
+    if w and vim.b[ev.buf].ex_new then api.nvim_win_call(w, ex_refresh) end
+  end,
+})
+-- l / Enter: files open in the main window (netrw would use whichever window
+-- was last, even quickfix or help); folders are left to netrw.
+local function explorer_enter()
+  local e = ex_cur()
+  if not ex_editable(e) or e.dir then return explorer_actions.open() end
+  api.nvim_set_current_win(main_win_or_split())
+  vim.cmd("edit " .. fn.fnameescape(e.path))
+end
 map("n", "<leader>e", function() explorer_open(fn.getcwd()) end, { desc = "Explorer" })
 map("n", "<leader>E", function() explorer_open(fn.expand("%:p:h")) end, { desc = "Explorer (this file's folder)" })
 
@@ -395,14 +467,8 @@ api.nvim_create_autocmd("BufWinEnter", {
     if not vim.w[win].explorer or not is_file(ev.buf) then return end
     vim.schedule(function()
       if not api.nvim_win_is_valid(win) or api.nvim_win_get_buf(win) ~= ev.buf or not is_file(ev.buf) then return end
-      local target = main_win()
       api.nvim_set_current_win(win)
-      if not target then -- the explorer was the only window: make a main one
-        vim.cmd("botright vsplit")
-        target = api.nvim_get_current_win()
-        unstyle(target)
-        api.nvim_set_current_win(win)
-      end
+      local target = main_win_or_split()
       ex_refresh() -- puts the tree back, with the same folders open
       api.nvim_win_set_buf(target, ev.buf)
       api.nvim_set_current_win(target)
@@ -416,7 +482,8 @@ api.nvim_create_autocmd("FileType", {
     local function bmap(lhs, rhs, desc, remap)
       map("n", lhs, rhs, { buffer = ev.buf, nowait = true, remap = remap, desc = desc })
     end
-    bmap("l", explorer_actions.open, "Open / expand")
+    bmap("l", explorer_enter, "Open / expand")
+    bmap("<CR>", explorer_enter, "Open / expand")
     bmap("h", explorer_actions.close, "Collapse")
     bmap("<BS>", "-", "Up a folder", true)
     bmap("a", explorer_actions.add, "Add file / folder/")
@@ -760,6 +827,20 @@ local function project_files()
   return vim.tbl_filter(function(f) return not deleted[f] end, files)
 end
 
+-- Files opened this session, newest first. (v:oldfiles is only updated when
+-- Neovim quits, so on its own it would miss them.)
+local session_files = {}
+api.nvim_create_autocmd("BufEnter", {
+  callback = function(ev)
+    local name = api.nvim_buf_get_name(ev.buf)
+    if name == "" or vim.bo[ev.buf].buftype ~= "" then return end
+    for i, f in ipairs(session_files) do
+      if f == name then table.remove(session_files, i) break end
+    end
+    table.insert(session_files, 1, name)
+  end,
+})
+
 local pickers = {
   files = function()
     pick({ title = "Files", items = project_files(), on_choose = open_file })
@@ -777,7 +858,7 @@ local pickers = {
   recent = function()
     local current = fn.expand("%:p")
     local items, seen = {}, {}
-    for _, f in ipairs(vim.v.oldfiles) do
+    for _, f in ipairs(vim.list_extend(vim.list_extend({}, session_files), vim.v.oldfiles)) do
       if f ~= current and not seen[f] and fn.filereadable(f) == 1 then
         seen[f] = true
         table.insert(items, short(f))
@@ -822,7 +903,23 @@ else
   o.grepformat = "%f:%l:%m"
 end
 
--- grep(pattern, { word = true, fixed = true }) fills quickfix and opens it.
+-- The project the current file belongs to: the nearest folder above it with a
+-- project file (go.mod etc.), else the folder nvim was started in. Like
+-- LazyVim's "root": from a Go file in bookshelf/, grep searches bookshelf/.
+local root_markers = { "go.mod", "package.json", "pyproject.toml", "Cargo.toml" }
+local function project_root()
+  local dir = fn.expand("%:p:h")
+  local marker = fn.isdirectory(dir) == 1 and vim.fs.find(root_markers, { upward = true, path = dir })[1]
+  return marker and vim.fs.dirname(marker) or fn.getcwd()
+end
+-- The folder to show and search: "." for the cwd, else relative to it.
+local function project_dir()
+  local rel = fn.fnamemodify(project_root(), ":.")
+  return (rel == "" or rel == fn.getcwd()) and "." or rel
+end
+
+-- grep(pattern, { word = true, fixed = true }) searches the current project,
+-- fills quickfix and opens it.
 local function grep(pattern, flags)
   flags = flags or {}
   local args
@@ -834,15 +931,19 @@ local function grep(pattern, flags)
     if not pattern:find("%u") then table.insert(args, "-i") end -- smart case
   end
   if flags.word then table.insert(args, "-w") end
-  vim.list_extend(args, { "--", pattern })
-  if not has_rg then table.insert(args, ".") end
+  local dir = flags.dir or project_dir()
+  vim.list_extend(args, { "--", pattern, dir })
   local lines = vim.tbl_map(function(l) return (l:gsub("^%./", "")) end, fn.systemlist(args))
-  fn.setqflist({}, " ", { title = "grep " .. pattern, lines = lines, efm = vim.o.grepformat })
-  if #lines == 0 then return vim.notify("No matches for " .. pattern) end
+  local where = dir == "." and "" or " in " .. dir .. "/"
+  fn.setqflist({}, " ", { title = "grep " .. pattern .. where, lines = lines, efm = vim.o.grepformat })
+  if #lines == 0 then return vim.notify("No matches for " .. pattern .. where) end
   vim.cmd("botright copen")
 end
 local function grep_prompt()
-  vim.ui.input({ prompt = "Grep: " }, function(p) if p and p ~= "" then grep(p) end end)
+  local dir = project_dir()
+  vim.ui.input({ prompt = dir == "." and "Grep" or "Grep in " .. dir .. "/" }, function(p)
+    if p and p ~= "" then grep(p, { dir = dir }) end
+  end)
 end
 map("n", "<leader>/", grep_prompt, { desc = "Grep project" })
 map("n", "<leader>sg", grep_prompt, { desc = "Grep project" })
@@ -871,6 +972,27 @@ map("n", "<leader>xx", function()
   vim.diagnostic.setqflist({ open = false })
   vim.cmd("botright copen")
 end, { desc = "All diagnostics (quickfix)" })
+
+-- Space c m: check the Go module this file is in with `go vet` (which also
+-- compiles it) and put every problem in quickfix. Works without gopls.
+map("n", "<leader>cm", function()
+  local marker = vim.fs.find("go.mod", { upward = true, path = fn.expand("%:p:h") })[1]
+  if not marker then return vim.notify("Not inside a Go module (no go.mod above this file)") end
+  local root = vim.fs.dirname(marker)
+  local items = {}
+  for _, line in ipairs(fn.systemlist({ "go", "-C", root, "vet", "./..." })) do
+    local file, lnum, col, text = line:gsub("^vet: ", ""):match("^%.?/?([^:]+%.go):(%d+):(%d+): (.*)$")
+    if file then
+      table.insert(items, { filename = root .. "/" .. file, lnum = tonumber(lnum), col = tonumber(col), text = text })
+    end
+  end
+  fn.setqflist({}, " ", { title = "go vet", items = items })
+  if #items == 0 then
+    vim.cmd("cclose")
+    return vim.notify(vim.v.shell_error == 0 and "go vet: no problems" or "go vet failed (see :!go vet ./...)")
+  end
+  vim.cmd("botright copen")
+end, { desc = "Check Go module (go vet)" })
 
 local servers = {
   go = { cmd = { "gopls" }, root = { "go.mod", ".git" } },
@@ -1017,20 +1139,47 @@ map("t", "<Esc><Esc>", [[<C-\><C-n>]], { desc = "Terminal normal mode" })
 -- Sessions: saved per folder on quit, Space q s restores
 ---------------------------------------------------------------------------
 local session_dir = fn.stdpath("state") .. "/sessions/"
-local function session_file() return session_dir .. fn.getcwd():gsub("/", "%%") .. ".vim" end
+local function session_file(dir) return session_dir .. (dir or fn.getcwd()):gsub("/", "%%") .. ".vim" end
+-- A session can't bring the explorer back properly (it returns as a plain,
+-- broken window), so leave it out when saving and clear it out after loading.
+local function drop_explorer()
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if vim.bo[b].filetype == "netrw" or api.nvim_buf_get_name(b):match("NetrwTreeListing$") then
+      if #api.nvim_list_wins() == 1 and api.nvim_get_current_buf() == b then vim.cmd.enew() end
+      pcall(api.nvim_buf_delete, b, { force = true })
+    end
+  end
+end
 api.nvim_create_autocmd("VimLeavePre", {
   callback = function()
     local real = vim.tbl_filter(function(b) return api.nvim_buf_get_name(b) ~= "" and vim.bo[b].buftype == "" end, listed_buffers())
     if #real == 0 then return end
+    drop_explorer()
     fn.mkdir(session_dir, "p")
     vim.cmd("mksession! " .. fn.fnameescape(session_file()))
   end,
 })
+local function load_session(f)
+  drop_explorer() -- an open explorer would stop the session's layout coming back
+  vim.cmd("silent! source " .. fn.fnameescape(f))
+  drop_explorer()
+end
 map("n", "<leader>qs", function()
   local f = session_file()
   if fn.filereadable(f) == 0 then return vim.notify("No saved session for this folder") end
-  vim.cmd("silent! source " .. fn.fnameescape(f))
+  load_session(f)
 end, { desc = "Restore session" })
+map("n", "<leader>qS", function()
+  local files = fn.glob(session_dir .. "*.vim", false, true)
+  local mtime = {}
+  for _, f in ipairs(files) do mtime[f] = fn.getftime(f) end
+  table.sort(files, function(a, b) return mtime[a] > mtime[b] end)
+  local items = vim.tbl_map(function(f) return (fn.fnamemodify(f, ":t:r"):gsub("%%", "/")) end, files)
+  if #items == 0 then return vim.notify("No saved sessions yet (one is saved per folder when you quit)") end
+  pick({ title = "Sessions", items = items, on_choose = function(dir)
+    load_session(session_file(dir))
+  end })
+end, { desc = "Select session" })
 
 ---------------------------------------------------------------------------
 -- Theme: Catppuccin Mocha, written out by hand since the plugin can't be
